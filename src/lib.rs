@@ -155,7 +155,8 @@ fn zone_publish_inner(
                 Ok(result) => {
                     let id_bytes: [u8; 32] = result.inscription_id.into();
                     let id_hex = hex::encode(id_bytes);
-                    eprintln!("zone_publish: inscription_id={}", id_hex);
+                    let cp_last_msg_id = hex::encode(<[u8; 32]>::from(result.checkpoint.last_msg_id));
+                    eprintln!("zone_publish: inscription_id={id_hex} checkpoint.last_msg_id={cp_last_msg_id}");
                     // Save checkpoint with pending_txs cleared + channel sidecar.
                     let mut clean_cp = result.checkpoint.clone();
                     clean_cp.pending_txs.clear();
@@ -494,8 +495,10 @@ fn zone_sequencer_create_inner(
                 &format!(r#"{{"slot":{},"last_id":null}}"#, start_slot)
             ).ok();
 
+            eprintln!("zone_sequencer_create: scan_channel_tip start_slot={start_slot} tip_slot={tip_slot}");
             let mut last_msg_id = fallback;
             let mut cursor_opt = cursor;
+            let mut pages = 0u32;
             loop {
                 let poll = match indexer.next_messages(cursor_opt, 1000).await {
                     Ok(p) => p,
@@ -504,21 +507,30 @@ fn zone_sequencer_create_inner(
                         break;
                     }
                 };
+                pages += 1;
+                let msg_count = poll.messages.len();
                 if let Some(last) = poll.messages.last() {
+                    let id_hex = hex::encode(<[u8; 32]>::from(last.id));
+                    eprintln!("zone_sequencer_create: scan page {pages}: {msg_count} msgs, latest id={id_hex}");
                     last_msg_id = Some(last.id);
-                }
-                if poll.messages.is_empty() {
-                    break;
+                } else {
+                    eprintln!("zone_sequencer_create: scan page {pages}: 0 msgs (gap)");
                 }
                 let cursor_slot = serde_json::to_value(&poll.cursor)
                     .ok()
                     .and_then(|v| v["slot"].as_u64())
                     .unwrap_or(0);
+                // Stop when cursor has reached tip, regardless of whether this
+                // page was empty.  Do NOT break on empty pages — the channel
+                // may have writes in later slot ranges separated by gaps.
+                eprintln!("zone_sequencer_create: scan cursor_slot={cursor_slot} tip_slot={tip_slot}");
                 if cursor_slot >= tip_slot {
                     break;
                 }
                 cursor_opt = Some(poll.cursor);
             }
+            let final_id = last_msg_id.map(|id| hex::encode(<[u8; 32]>::from(id))).unwrap_or_else(|| "none".to_string());
+            eprintln!("zone_sequencer_create: scan complete after {pages} pages, last_msg_id={final_id}");
             last_msg_id
         })
     };
@@ -636,7 +648,8 @@ fn zone_sequencer_publish_inner(
                     Ok(result) => {
                         let id_bytes: [u8; 32] = result.inscription_id.into();
                         let id_hex = hex::encode(id_bytes);
-                        eprintln!("zone_sequencer_publish: inscription_id={}", id_hex);
+                        let cp_last_msg_id = hex::encode(<[u8; 32]>::from(result.checkpoint.last_msg_id));
+                        eprintln!("zone_sequencer_publish: inscription_id={id_hex} checkpoint.last_msg_id={cp_last_msg_id}");
                         let mut clean_cp = result.checkpoint.clone();
                         clean_cp.pending_txs.clear();
                         save_checkpoint(&h.checkpoint_path, &clean_cp, &h.channel_id_hex);
