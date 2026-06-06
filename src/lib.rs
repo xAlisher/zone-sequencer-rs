@@ -476,8 +476,8 @@ fn zone_sequencer_create_inner(
     // `start_slot`.  Returns the last MsgId found, or `fallback` if the scan
     // finds nothing or fails.
     let scan_channel_tip = |start_slot: u64,
-                             fallback: Option<logos_blockchain_zone_sdk::sequencer::MsgId>|
-     -> Option<logos_blockchain_zone_sdk::sequencer::MsgId> {
+                             fallback: Option<lb_core::mantle::ops::channel::MsgId>|
+     -> Option<lb_core::mantle::ops::channel::MsgId> {
         rt.block_on(async {
             let indexer = ZoneIndexer::new(channel_id, url.clone(), None);
             let http_client = lb_common_http_client::CommonHttpClient::new(None);
