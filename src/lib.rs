@@ -472,62 +472,106 @@ fn zone_sequencer_create_inner(
 
     let rt = get_runtime();
 
-    let checkpoint = load_checkpoint(ckpt_path, channel_id_hex_str).or_else(|| {
-        // No checkpoint — bootstrap by scanning the channel for the latest
-        // inscription.  Without this, the sequencer starts with MsgId::root()
-        // as parent, which is only valid for brand-new channels.  On existing
-        // channels the node rejects inscriptions with a duplicate root parent.
-        eprintln!("zone_sequencer_create: bootstrapping last_msg_id from chain...");
+    // Scan the channel for its latest on-chain message ID, starting from
+    // `start_slot`.  Returns the last MsgId found, or `fallback` if the scan
+    // finds nothing or fails.
+    let scan_channel_tip = |start_slot: u64,
+                             fallback: Option<logos_blockchain_zone_sdk::sequencer::MsgId>|
+     -> Option<logos_blockchain_zone_sdk::sequencer::MsgId> {
         rt.block_on(async {
             let indexer = ZoneIndexer::new(channel_id, url.clone(), None);
             let http_client = lb_common_http_client::CommonHttpClient::new(None);
 
-            let info = http_client.consensus_info(url.clone()).await.ok()?;
-            let tip_slot: u64 = info.slot.into();
-            let lib: lb_core::header::HeaderId = info.lib;
+            let tip_slot: u64 = match http_client.consensus_info(url.clone()).await {
+                Ok(i) => i.slot.into(),
+                Err(e) => {
+                    eprintln!("zone_sequencer_create: consensus_info failed: {e}");
+                    return fallback;
+                }
+            };
 
-            // Scan the last 100k slots for our channel's messages
-            let lookback: u64 = 100_000;
-            let start_slot = tip_slot.saturating_sub(lookback);
             let cursor = serde_json::from_str::<logos_blockchain_zone_sdk::indexer::Cursor>(
                 &format!(r#"{{"slot":{},"last_id":null}}"#, start_slot)
             ).ok();
 
-            let mut last_msg_id = None;
+            let mut last_msg_id = fallback;
             let mut cursor_opt = cursor;
             loop {
-                let poll = indexer.next_messages(cursor_opt, 1000).await.ok()?;
+                let poll = match indexer.next_messages(cursor_opt, 1000).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("zone_sequencer_create: channel scan error: {e}");
+                        break;
+                    }
+                };
                 if let Some(last) = poll.messages.last() {
                     last_msg_id = Some(last.id);
                 }
                 if poll.messages.is_empty() {
                     break;
                 }
-                // Check if cursor advanced past tip
-                let cursor_val = serde_json::to_value(&poll.cursor).ok()?;
-                let cursor_slot = cursor_val["slot"].as_u64().unwrap_or(0);
+                let cursor_slot = serde_json::to_value(&poll.cursor)
+                    .ok()
+                    .and_then(|v| v["slot"].as_u64())
+                    .unwrap_or(0);
                 if cursor_slot >= tip_slot {
                     break;
                 }
                 cursor_opt = Some(poll.cursor);
             }
-
-            if let Some(msg_id) = last_msg_id {
-                let lib_slot = info.slot;
-                eprintln!("zone_sequencer_create: bootstrapped last_msg_id={}",
-                    hex::encode(<[u8; 32]>::from(msg_id)));
-                Some(SequencerCheckpoint {
-                    last_msg_id: msg_id,
-                    pending_txs: vec![],
-                    lib,
-                    lib_slot,
-                })
-            } else {
-                eprintln!("zone_sequencer_create: no existing inscriptions — starting from root");
-                None
-            }
+            last_msg_id
         })
-    });
+    };
+
+    let checkpoint = if let Some(mut cp) = load_checkpoint(ckpt_path, channel_id_hex_str) {
+        // Checkpoint loaded — verify its last_msg_id against the actual on-chain
+        // channel tip.  If the channel advanced while we were offline (another
+        // sequencer instance wrote to it, or we missed blocks), our stored
+        // last_msg_id is stale.  Using it as the parent causes every publish to
+        // be rejected by block producers with InvalidParent; the tx is silently
+        // dropped from the mempool and the channel write never lands on-chain.
+        let start_slot: u64 = cp.lib_slot.into();
+        eprintln!("zone_sequencer_create: verifying checkpoint last_msg_id from slot {start_slot}...");
+        if let Some(on_chain) = scan_channel_tip(start_slot, Some(cp.last_msg_id)) {
+            let stale = <[u8; 32]>::from(on_chain) != <[u8; 32]>::from(cp.last_msg_id);
+            if stale {
+                eprintln!(
+                    "zone_sequencer_create: checkpoint stale — advancing last_msg_id: {} → {}",
+                    hex::encode(<[u8; 32]>::from(cp.last_msg_id)),
+                    hex::encode(<[u8; 32]>::from(on_chain))
+                );
+                cp.last_msg_id = on_chain;
+            } else {
+                eprintln!("zone_sequencer_create: checkpoint is current");
+            }
+        }
+        Some(cp)
+    } else {
+        // No checkpoint — bootstrap by scanning the channel for the latest
+        // inscription.  Without this, the sequencer starts with MsgId::root()
+        // as parent, which is only valid for brand-new channels.  On existing
+        // channels the node rejects inscriptions with a duplicate root parent.
+        eprintln!("zone_sequencer_create: bootstrapping last_msg_id from chain...");
+        let info = rt.block_on(lb_common_http_client::CommonHttpClient::new(None)
+            .consensus_info(url.clone()));
+        let info = info.ok()?;
+        let tip_slot: u64 = info.slot.into();
+        let lookback: u64 = 100_000;
+        let start_slot = tip_slot.saturating_sub(lookback);
+        if let Some(msg_id) = scan_channel_tip(start_slot, None) {
+            eprintln!("zone_sequencer_create: bootstrapped last_msg_id={}",
+                hex::encode(<[u8; 32]>::from(msg_id)));
+            Some(SequencerCheckpoint {
+                last_msg_id: msg_id,
+                pending_txs: vec![],
+                lib: info.lib,
+                lib_slot: info.slot,
+            })
+        } else {
+            eprintln!("zone_sequencer_create: no existing inscriptions — starting from root");
+            None
+        }
+    };
 
     eprintln!("zone_sequencer_create: node={} channel={} checkpoint={}",
         url, channel_id_hex_str,
