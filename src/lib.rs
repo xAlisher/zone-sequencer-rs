@@ -497,9 +497,20 @@ fn zone_sequencer_create_inner(
 
             eprintln!("zone_sequencer_create: scan_channel_tip start_slot={start_slot} tip_slot={tip_slot}");
             let mut last_msg_id = fallback;
-            let mut cursor_opt = cursor;
             let mut pages = 0u32;
+            // Slot-based cursor: advance by PAGE_SLOTS when the indexer returns
+            // an empty page (cursor stuck).  This avoids an infinite loop when
+            // no messages exist in a slot range — the indexer returns the same
+            // cursor repeatedly on empty pages.
+            const PAGE_SLOTS: u64 = 10_000;
+            let mut current_slot = start_slot;
             loop {
+                // Build a fresh slot-based cursor each iteration so we always
+                // advance even when the indexer cursor is stuck.
+                let cursor_opt = serde_json::from_str::<logos_blockchain_zone_sdk::indexer::Cursor>(
+                    &format!(r#"{{"slot":{},"last_id":null}}"#, current_slot)
+                ).ok();
+
                 let poll = match indexer.next_messages(cursor_opt, 1000).await {
                     Ok(p) => p,
                     Err(e) => {
@@ -513,21 +524,21 @@ fn zone_sequencer_create_inner(
                     let id_hex = hex::encode(<[u8; 32]>::from(last.id));
                     eprintln!("zone_sequencer_create: scan page {pages}: {msg_count} msgs, latest id={id_hex}");
                     last_msg_id = Some(last.id);
+                    // Advance past all the messages on this page.
+                    let page_cursor_slot = serde_json::to_value(&poll.cursor)
+                        .ok()
+                        .and_then(|v| v["slot"].as_u64())
+                        .unwrap_or(current_slot + 1);
+                    current_slot = page_cursor_slot.max(current_slot + 1);
                 } else {
-                    eprintln!("zone_sequencer_create: scan page {pages}: 0 msgs (gap)");
+                    eprintln!("zone_sequencer_create: scan page {pages}: 0 msgs (gap), advancing +{PAGE_SLOTS} slots");
+                    // Empty page: indexer cursor may be stuck.  Jump forward.
+                    current_slot += PAGE_SLOTS;
                 }
-                let cursor_slot = serde_json::to_value(&poll.cursor)
-                    .ok()
-                    .and_then(|v| v["slot"].as_u64())
-                    .unwrap_or(0);
-                // Stop when cursor has reached tip, regardless of whether this
-                // page was empty.  Do NOT break on empty pages — the channel
-                // may have writes in later slot ranges separated by gaps.
-                eprintln!("zone_sequencer_create: scan cursor_slot={cursor_slot} tip_slot={tip_slot}");
-                if cursor_slot >= tip_slot {
+                eprintln!("zone_sequencer_create: scan next_slot={current_slot} tip_slot={tip_slot}");
+                if current_slot >= tip_slot {
                     break;
                 }
-                cursor_opt = Some(poll.cursor);
             }
             let final_id = last_msg_id.map(|id| hex::encode(<[u8; 32]>::from(id))).unwrap_or_else(|| "none".to_string());
             eprintln!("zone_sequencer_create: scan complete after {pages} pages, last_msg_id={final_id}");
