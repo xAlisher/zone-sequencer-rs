@@ -8,7 +8,7 @@ use futures::StreamExt as _;
 use lb_core::mantle::ops::channel::{ChannelId, MsgId};
 use lb_key_management_system_service::keys::Ed25519Key;
 use logos_blockchain_zone_sdk::{CommonHttpClient, Slot, ZoneMessage};
-use logos_blockchain_zone_sdk::adapter::NodeHttpClient;
+use logos_blockchain_zone_sdk::adapter::{Node as _, NodeHttpClient};
 use logos_blockchain_zone_sdk::indexer::ZoneIndexer;
 use logos_blockchain_zone_sdk::sequencer::{ZoneSequencer, SequencerCheckpoint};
 use reqwest::Url;
