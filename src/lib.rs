@@ -120,6 +120,110 @@ pub extern "C" fn zone_publish(
     }
 }
 
+/// Bootstrap a sequencer checkpoint for a channel that has no local checkpoint.
+///
+/// Shared by the stateless (`zone_publish`) and stateful (`zone_sequencer_create`)
+/// paths so both resolve the starting parent identically:
+///   - `GET {node}/channel/{id}` is the authoritative ledger ChannelState (#1):
+///       * tip present  → start from that tip, lib_slot = current LIB.
+///       * "channel not found" (genuinely fresh) → start from root, lib_slot =
+///         current LIB. Returning `None` here is what broke fresh channels: with
+///         no checkpoint the SDK starts at genesis and backfills the WHOLE chain
+///         (Slot 1 → LIB) before signalling ready, which on a long chain exceeds
+///         `wait_ready`'s timeout and the first publish never lands. A fresh
+///         channel has no history to backfill, so pin it at current LIB and skip.
+///   - node without `/channel` → bounded chain-scan fallback (honest re limits, #2).
+async fn bootstrap_checkpoint(
+    url: &Url,
+    channel_id_hex_str: &str,
+    channel_id: ChannelId,
+) -> Option<SequencerCheckpoint> {
+    let node = make_node(url.clone());
+    let info = match node.consensus_info().await {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("bootstrap: consensus_info error: {:?}", e);
+            return None;
+        }
+    };
+
+    let endpoint = format!("{}/channel/{}",
+        url.as_str().trim_end_matches('/'), channel_id_hex_str);
+    match reqwest::Client::new()
+        .get(&endpoint)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+    {
+        Ok(resp) if resp.status().is_success() => {
+            let tip = resp.json::<serde_json::Value>().await.ok()
+                .and_then(|v| v.get("tip").and_then(|t| t.as_str()).map(String::from))
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+            if let Some(tip_bytes) = tip {
+                eprintln!("bootstrap: channel tip from node = {}", hex::encode(tip_bytes));
+                return Some(SequencerCheckpoint {
+                    last_msg_id: MsgId::from(tip_bytes),
+                    pending_txs: vec![],
+                    lib: info.lib,
+                    lib_slot: info.lib_slot,
+                });
+            }
+            eprintln!("bootstrap: /channel response unparseable — falling back to chain scan");
+        }
+        Ok(resp) => {
+            eprintln!("bootstrap: node has no state for this channel (HTTP {}) — fresh channel, starting from root at current LIB (skip genesis backfill)",
+                resp.status());
+            return Some(SequencerCheckpoint {
+                last_msg_id: MsgId::root(),
+                pending_txs: vec![],
+                lib: info.lib,
+                lib_slot: info.lib_slot,
+            });
+        }
+        Err(e) => {
+            eprintln!("bootstrap: /channel query failed ({}) — falling back to chain scan", e);
+        }
+    }
+
+    // Fallback for nodes without /channel: bounded scan. Finding nothing here does
+    // NOT prove the channel is empty (#2) — deeper history may exist.
+    let tip_slot: u64 = info.slot.into();
+    let lookback: u64 = 100_000;
+    let start_slot = tip_slot.saturating_sub(lookback);
+
+    let indexer = ZoneIndexer::new(channel_id, node);
+    let stream = match indexer.next_messages(Some((MsgId::root(), Slot::new(start_slot)))).await {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("bootstrap: indexer error: {:?}", e);
+            return None;
+        }
+    };
+
+    let mut last: Option<(MsgId, Slot)> = None;
+    let mut pinned = std::pin::pin!(stream);
+    while let Some((msg, slot)) = pinned.next().await {
+        if let ZoneMessage::Block(b) = msg {
+            last = Some((b.id, slot));
+        }
+    }
+
+    if let Some((msg_id, lib_slot_approx)) = last {
+        eprintln!("bootstrap: last_msg_id={}", hex::encode(<[u8; 32]>::from(msg_id)));
+        Some(SequencerCheckpoint {
+            last_msg_id: msg_id,
+            pending_txs: vec![],
+            lib: info.lib,
+            lib_slot: lib_slot_approx,
+        })
+    } else {
+        eprintln!("bootstrap: scan found no messages in last {} slots — deferring to SDK backfill (deeper history may still exist)",
+            lookback);
+        None
+    }
+}
+
 fn zone_publish_inner(
     node_url: *const c_char,
     channel_id_hex: *const c_char,
@@ -139,7 +243,9 @@ fn zone_publish_inner(
         unsafe { CStr::from_ptr(checkpoint_path) }.to_str().unwrap_or("")
     };
 
-    let checkpoint = load_checkpoint(ckpt_path, channel_id_hex_str);
+    let rt = get_runtime();
+    let checkpoint = load_checkpoint(ckpt_path, channel_id_hex_str)
+        .or_else(|| rt.block_on(bootstrap_checkpoint(&url, channel_id_hex_str, channel_id)));
     eprintln!("zone_publish: node={} channel={} checkpoint={}",
         url, channel_id_hex_str,
         if checkpoint.is_some() { "loaded" } else { "fresh" });
@@ -147,7 +253,6 @@ fn zone_publish_inner(
     let data_bytes = data_str.as_bytes().to_vec();
     eprintln!("zone_publish: publishing {} bytes...", data_bytes.len());
 
-    let rt = get_runtime();
     let node = make_node(url);
 
     let result = rt.block_on(async {
@@ -492,97 +597,8 @@ fn zone_sequencer_create_inner(
 
     let rt = get_runtime();
 
-    let checkpoint = load_checkpoint(ckpt_path, channel_id_hex_str).or_else(|| {
-        rt.block_on(async {
-            let node = make_node(url.clone());
-            let info = match node.consensus_info().await {
-                Ok(i) => i,
-                Err(e) => {
-                    eprintln!("zone_sequencer_create: consensus_info error: {:?}", e);
-                    return None;
-                }
-            };
-
-            // Authoritative bootstrap (#1): GET {node}/channel/{id} returns the ledger's
-            // ChannelState — its `tip` is literally what InvalidParent validation compares
-            // parents against, at any history depth. The chain scan below only sees a
-            // bounded window: with deeper history it misses the tip, the sequencer
-            // publishes from root, and the node rejects every tx (observed with history
-            // ~1.4M slots deep). "channel not found" = genuinely fresh → root is correct.
-            let endpoint = format!("{}/channel/{}",
-                url.as_str().trim_end_matches('/'), channel_id_hex_str);
-            match reqwest::Client::new()
-                .get(&endpoint)
-                .timeout(Duration::from_secs(10))
-                .send()
-                .await
-            {
-                Ok(resp) if resp.status().is_success() => {
-                    let tip = resp.json::<serde_json::Value>().await.ok()
-                        .and_then(|v| v.get("tip").and_then(|t| t.as_str()).map(String::from))
-                        .and_then(|h| hex::decode(h).ok())
-                        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
-                    if let Some(tip_bytes) = tip {
-                        eprintln!("zone_sequencer_create: bootstrap — channel tip from node = {}",
-                            hex::encode(tip_bytes));
-                        return Some(SequencerCheckpoint {
-                            last_msg_id: MsgId::from(tip_bytes),
-                            pending_txs: vec![],
-                            lib: info.lib,
-                            lib_slot: info.lib_slot,
-                        });
-                    }
-                    eprintln!("zone_sequencer_create: /channel response unparseable — falling back to chain scan");
-                }
-                Ok(resp) => {
-                    eprintln!("zone_sequencer_create: node has no state for this channel (HTTP {}) — fresh channel, starting from root",
-                        resp.status());
-                    return None;
-                }
-                Err(e) => {
-                    eprintln!("zone_sequencer_create: /channel query failed ({}) — falling back to chain scan", e);
-                }
-            }
-
-            // Fallback for nodes without /channel: bounded scan. Honest about its
-            // limits (#2) — finding nothing here does NOT prove the channel is empty.
-            let tip_slot: u64 = info.slot.into();
-            let lookback: u64 = 100_000;
-            let start_slot = tip_slot.saturating_sub(lookback);
-
-            let indexer = ZoneIndexer::new(channel_id, node);
-            let stream = match indexer.next_messages(Some((MsgId::root(), Slot::new(start_slot)))).await {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("zone_sequencer_create: indexer error: {:?}", e);
-                    return None;
-                }
-            };
-
-            let mut last: Option<(MsgId, Slot)> = None;
-            let mut pinned = std::pin::pin!(stream);
-            while let Some((msg, slot)) = pinned.next().await {
-                if let ZoneMessage::Block(b) = msg {
-                    last = Some((b.id, slot));
-                }
-            }
-
-            if let Some((msg_id, lib_slot_approx)) = last {
-                eprintln!("zone_sequencer_create: bootstrapped last_msg_id={}",
-                    hex::encode(<[u8; 32]>::from(msg_id)));
-                Some(SequencerCheckpoint {
-                    last_msg_id: msg_id,
-                    pending_txs: vec![],
-                    lib: info.lib,
-                    lib_slot: lib_slot_approx,
-                })
-            } else {
-                eprintln!("zone_sequencer_create: scan found no messages in last {} slots — deferring to SDK backfill (deeper history may still exist)",
-                    lookback);
-                None
-            }
-        })
-    });
+    let checkpoint = load_checkpoint(ckpt_path, channel_id_hex_str)
+        .or_else(|| rt.block_on(bootstrap_checkpoint(&url, channel_id_hex_str, channel_id)));
 
     eprintln!("zone_sequencer_create: node={} channel={} checkpoint={}",
         url, channel_id_hex_str,
