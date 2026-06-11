@@ -493,7 +493,6 @@ fn zone_sequencer_create_inner(
     let rt = get_runtime();
 
     let checkpoint = load_checkpoint(ckpt_path, channel_id_hex_str).or_else(|| {
-        eprintln!("zone_sequencer_create: bootstrapping last_msg_id from chain...");
         rt.block_on(async {
             let node = make_node(url.clone());
             let info = match node.consensus_info().await {
@@ -503,6 +502,50 @@ fn zone_sequencer_create_inner(
                     return None;
                 }
             };
+
+            // Authoritative bootstrap (#1): GET {node}/channel/{id} returns the ledger's
+            // ChannelState — its `tip` is literally what InvalidParent validation compares
+            // parents against, at any history depth. The chain scan below only sees a
+            // bounded window: with deeper history it misses the tip, the sequencer
+            // publishes from root, and the node rejects every tx (observed with history
+            // ~1.4M slots deep). "channel not found" = genuinely fresh → root is correct.
+            let endpoint = format!("{}/channel/{}",
+                url.as_str().trim_end_matches('/'), channel_id_hex_str);
+            match reqwest::Client::new()
+                .get(&endpoint)
+                .timeout(Duration::from_secs(10))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    let tip = resp.json::<serde_json::Value>().await.ok()
+                        .and_then(|v| v.get("tip").and_then(|t| t.as_str()).map(String::from))
+                        .and_then(|h| hex::decode(h).ok())
+                        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+                    if let Some(tip_bytes) = tip {
+                        eprintln!("zone_sequencer_create: bootstrap — channel tip from node = {}",
+                            hex::encode(tip_bytes));
+                        return Some(SequencerCheckpoint {
+                            last_msg_id: MsgId::from(tip_bytes),
+                            pending_txs: vec![],
+                            lib: info.lib,
+                            lib_slot: info.lib_slot,
+                        });
+                    }
+                    eprintln!("zone_sequencer_create: /channel response unparseable — falling back to chain scan");
+                }
+                Ok(resp) => {
+                    eprintln!("zone_sequencer_create: node has no state for this channel (HTTP {}) — fresh channel, starting from root",
+                        resp.status());
+                    return None;
+                }
+                Err(e) => {
+                    eprintln!("zone_sequencer_create: /channel query failed ({}) — falling back to chain scan", e);
+                }
+            }
+
+            // Fallback for nodes without /channel: bounded scan. Honest about its
+            // limits (#2) — finding nothing here does NOT prove the channel is empty.
             let tip_slot: u64 = info.slot.into();
             let lookback: u64 = 100_000;
             let start_slot = tip_slot.saturating_sub(lookback);
@@ -534,7 +577,8 @@ fn zone_sequencer_create_inner(
                     lib_slot: lib_slot_approx,
                 })
             } else {
-                eprintln!("zone_sequencer_create: no existing inscriptions — starting from root");
+                eprintln!("zone_sequencer_create: scan found no messages in last {} slots — deferring to SDK backfill (deeper history may still exist)",
+                    lookback);
                 None
             }
         })
