@@ -81,32 +81,22 @@ if (id) {
 
 ## Building against logos-blockchain v0.2
 
-Dependencies are pinned to logos-blockchain rev `8784b837` (== tag `0.2.0`, the v0.2
-testnet). The crate is a drop-in FFI replacement for the v0.1.x build — the C ABI in
-`zone_sequencer.h` is unchanged.
+The crate is a drop-in FFI replacement for the v0.1.x build — the C ABI in
+`zone_sequencer.h` is unchanged. `cargo build` / `cargo test` work out of the box.
 
-> ⚠️ **Upstream build blocker.** That rev (and every v0.2 tag) contains a stray
-> committed gitlink `.claude/worktrees/wf_d6259406-6a4-9` with **no `.gitmodules`
-> entry**, which makes `cargo`'s submodule walk abort on any git-dependency build:
->
-> ```
-> no URL configured for submodule '.claude/worktrees/wf_d6259406-6a4-9'; class=Submodule (17)
-> ```
->
-> Until upstream removes the gitlink (`git rm --cached .claude/worktrees/...`), build
-> via a local path override:
+Dependencies are pinned to **`xAlisher/logos-blockchain@39e29398`** — a fork of
+logos-blockchain v0.2 (testnet rev `8784b837` == tag `0.2.0`) with one cleanup commit.
+
+> ℹ️ **Why a fork.** The upstream v0.2 rev (and every v0.2 tag) ships a stray committed
+> gitlink `.claude/worktrees/wf_d6259406-6a4-9` with **no `.gitmodules` entry**, which
+> makes `cargo`'s submodule walk abort on any git-dependency build
+> (`no URL configured for submodule ...; class=Submodule (17)`). Reported upstream as
+> logos-blockchain#3062. Our fork branch `v0.2-nogitlink` just removes that gitlink.
+> **Once #3062 is merged upstream, repoint the four `logos-blockchain-*` deps back to
+> `logos-blockchain/logos-blockchain` at the fixed rev.**
 
 ```sh
-# full checkout of logos-blockchain at the pinned rev, next to this repo
-git clone --filter=blob:none https://github.com/logos-blockchain/logos-blockchain lb-v0.2
-( cd lb-v0.2 && git checkout 8784b837c558b037bf691b0cb720d1c0c20db245 )
-
-# temporarily point the four logos-blockchain-* deps at local paths, e.g.
-#   logos-blockchain-zone-sdk                       = { path = "../lb-v0.2/zone-sdk" }
-#   logos-blockchain-core                           = { path = "../lb-v0.2/core" }
-#   logos-blockchain-key-management-system-service  = { path = "../lb-v0.2/services/key-management-system" }
-#   logos-blockchain-common-http-client             = { path = "../lb-v0.2/nodes/node/http-client" }
-cargo test --lib
+cargo test --lib        # builds the full v0.2 workspace from the fork; 6/6 pass
 ```
 
 Live end-to-end test (opt-in, against a v0.2 node):

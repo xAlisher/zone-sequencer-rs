@@ -7,13 +7,13 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-logos-blockchain-zone-sdk = { git = "https://github.com/logos-blockchain/logos-blockchain", rev = "8784b837c558b037bf691b0cb720d1c0c20db245", package = "logos-blockchain-zone-sdk" }
-lb-key-management-system-service = { git = "https://github.com/logos-blockchain/logos-blockchain", rev = "8784b837c558b037bf691b0cb720d1c0c20db245", package = "logos-blockchain-key-management-system-service" }
-lb-core = { git = "https://github.com/logos-blockchain/logos-blockchain", rev = "8784b837c558b037bf691b0cb720d1c0c20db245", package = "logos-blockchain-core" }
+logos-blockchain-zone-sdk = { git = "https://github.com/xAlisher/logos-blockchain", rev = "39e29398e8c26e13a57ea6ad80d1a24beb21213f", package = "logos-blockchain-zone-sdk" }
+lb-key-management-system-service = { git = "https://github.com/xAlisher/logos-blockchain", rev = "39e29398e8c26e13a57ea6ad80d1a24beb21213f", package = "logos-blockchain-key-management-system-service" }
+lb-core = { git = "https://github.com/xAlisher/logos-blockchain", rev = "39e29398e8c26e13a57ea6ad80d1a24beb21213f", package = "logos-blockchain-core" }
 tokio = { version = "1", features = ["full"] }
 hex = "0.4"
 serde_json = "1"
-lb-common-http-client = { git = "https://github.com/logos-blockchain/logos-blockchain", rev = "8784b837c558b037bf691b0cb720d1c0c20db245", package = "logos-blockchain-common-http-client" }
+lb-common-http-client = { git = "https://github.com/xAlisher/logos-blockchain", rev = "39e29398e8c26e13a57ea6ad80d1a24beb21213f", package = "logos-blockchain-common-http-client" }
 reqwest = { version = "0.12", features = ["json"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
