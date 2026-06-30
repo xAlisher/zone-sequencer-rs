@@ -6,11 +6,12 @@ use std::fs;
 
 use futures::StreamExt as _;
 use lb_core::mantle::ops::channel::{ChannelId, MsgId};
+use lb_core::mantle::ops::channel::inscribe::Inscription;
 use lb_key_management_system_service::keys::Ed25519Key;
 use logos_blockchain_zone_sdk::{CommonHttpClient, Slot, ZoneMessage};
 use logos_blockchain_zone_sdk::adapter::{Node as _, NodeHttpClient};
 use logos_blockchain_zone_sdk::indexer::ZoneIndexer;
-use logos_blockchain_zone_sdk::sequencer::{ZoneSequencer, SequencerCheckpoint};
+use logos_blockchain_zone_sdk::sequencer::{ZoneSequencer, SequencerClient, SequencerCheckpoint};
 use reqwest::Url;
 use tokio::runtime::Runtime;
 
@@ -146,6 +147,8 @@ async fn bootstrap_checkpoint(
             return None;
         }
     };
+    // v0.2: chain info is nested under cryptarchia_info (was flat in v0.1.2).
+    let info = info.cryptarchia_info;
 
     let endpoint = format!("{}/channel/{}",
         url.as_str().trim_end_matches('/'), channel_id_hex_str);
@@ -193,7 +196,8 @@ async fn bootstrap_checkpoint(
     let start_slot = tip_slot.saturating_sub(lookback);
 
     let indexer = ZoneIndexer::new(channel_id, node);
-    let stream = match indexer.next_messages(Some((MsgId::root(), Slot::new(start_slot)))).await {
+    // v0.2: next_messages cursor is slot-only (was (MsgId, Slot) in v0.1.2).
+    let stream = match indexer.next_messages(Some(Slot::new(start_slot))).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("bootstrap: indexer error: {:?}", e);
@@ -253,43 +257,56 @@ fn zone_publish_inner(
     let data_bytes = data_str.as_bytes().to_vec();
     eprintln!("zone_publish: publishing {} bytes...", data_bytes.len());
 
+    let inscription = match Inscription::try_from(data_bytes) {
+        Ok(i) => i,
+        Err(e) => { eprintln!("zone_publish: inscription too large/invalid: {:?}", e); return None; }
+    };
+
     let node = make_node(url);
 
     let result = rt.block_on(async {
-        let (sequencer, mut handle) = ZoneSequencer::init(channel_id, signing_key, node, checkpoint);
-        let _task = sequencer.spawn();
+        // v0.2: init returns the sequencer alone; publish is routed through the
+        // async SequencerClient, but its await only resolves while the drive
+        // loop (next_event) is being polled — so spawn a drive task for the
+        // lifetime of the publish.
+        let mut sequencer = ZoneSequencer::init(channel_id, signing_key, node, checkpoint);
+        let client = sequencer.client();
+        let mut ready_rx = client.subscribe_ready();
+        let drive = tokio::spawn(async move { loop { let _ = sequencer.next_event().await; } });
 
-        match tokio::time::timeout(Duration::from_secs(60), handle.wait_ready()).await {
-            Ok(()) => {}
-            Err(_) => {
+        let outcome = async {
+            if tokio::time::timeout(Duration::from_secs(60), ready_rx.wait_for(|r| *r)).await.is_err() {
                 eprintln!("zone_publish: timeout waiting for sequencer ready");
                 return None;
             }
-        }
 
-        let mut attempts = 0;
-        loop {
-            attempts += 1;
-            match handle.publish_message(data_bytes.clone()).await {
-                Ok(result) => {
-                    let id_bytes: [u8; 32] = result.inscription_id.into();
-                    let id_hex = hex::encode(id_bytes);
-                    eprintln!("zone_publish: inscription_id={}", id_hex);
-                    let mut clean_cp = result.checkpoint.clone();
-                    clean_cp.pending_txs.clear();
-                    save_checkpoint(ckpt_path, &clean_cp, channel_id_hex_str);
-                    return Some(id_hex);
-                }
-                Err(e) => {
-                    if attempts > 5 {
-                        eprintln!("zone_publish: failed after {} attempts: {}", attempts, e);
-                        return None;
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                match client.publish(inscription.clone()).await {
+                    Ok((res, cp)) => {
+                        let id_bytes: [u8; 32] = res.inscription_id().into();
+                        let id_hex = hex::encode(id_bytes);
+                        eprintln!("zone_publish: inscription_id={}", id_hex);
+                        let mut clean_cp = cp;
+                        clean_cp.pending_txs.clear();
+                        save_checkpoint(ckpt_path, &clean_cp, channel_id_hex_str);
+                        return Some(id_hex);
                     }
-                    eprintln!("zone_publish: attempt {}: {} — retrying in 1s...", attempts, e);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Err(e) => {
+                        if attempts > 5 {
+                            eprintln!("zone_publish: failed after {} attempts: {}", attempts, e);
+                            return None;
+                        }
+                        eprintln!("zone_publish: attempt {}: {} — retrying in 1s...", attempts, e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                 }
             }
-        }
+        }.await;
+
+        drive.abort();
+        outcome
     })?;
 
     CString::new(result).ok()
@@ -338,11 +355,11 @@ fn zone_query_channel_inner(
     let result = rt.block_on(async {
         let start_cursor = match node.consensus_info().await {
             Ok(info) => {
-                let tip_slot: u64 = info.slot.into();
+                let tip_slot: u64 = info.cryptarchia_info.slot.into();
                 let lookback: u64 = 50000;
                 let start_slot = tip_slot.saturating_sub(lookback);
                 eprintln!("zone_query_channel: tip_slot={} start_slot={}", tip_slot, start_slot);
-                Some((MsgId::root(), Slot::new(start_slot)))
+                Some(Slot::new(start_slot))
             }
             Err(e) => {
                 eprintln!("zone_query_channel: consensus_info error: {:?} — scanning from genesis", e);
@@ -364,9 +381,9 @@ fn zone_query_channel_inner(
                 match msg {
                     ZoneMessage::Block(b) => Some(serde_json::json!({
                         "id": hex::encode(<[u8; 32]>::from(b.id)),
-                        "data": String::from_utf8_lossy(&b.data).to_string()
+                        "data": String::from_utf8_lossy(b.data.as_slice()).to_string()
                     })),
-                    ZoneMessage::Deposit(_) => None,
+                    ZoneMessage::Deposit(_) | ZoneMessage::Withdraw(_) => None,
                 }
             })
             .take(limit as usize)
@@ -454,7 +471,9 @@ fn zone_query_channel_paged_inner(
     );
     let url: Url = node_url_str.parse().ok()?;
 
-    let start_cursor: Option<(MsgId, Slot)> = if cursor_json.is_null() {
+    // v0.2: next_messages cursor is slot-only. The wire cursor still carries a
+    // msg_id (C ABI / module contract unchanged) but only the slot is used.
+    let start_cursor: Option<Slot> = if cursor_json.is_null() {
         None
     } else {
         let cstr = unsafe { CStr::from_ptr(cursor_json) }.to_str().unwrap_or("");
@@ -462,14 +481,12 @@ fn zone_query_channel_paged_inner(
             None
         } else {
             let v: serde_json::Value = serde_json::from_str(cstr).ok()?;
-            let msg_id_hex = v["msg_id"].as_str().unwrap_or("");
             let slot_num = v["slot"].as_u64().unwrap_or(0);
-            let msg_id_bytes: [u8; 32] = hex::decode(msg_id_hex).ok()?.try_into().ok()?;
-            Some((MsgId::from(msg_id_bytes), Slot::new(slot_num)))
+            Some(Slot::new(slot_num))
         }
     };
 
-    let cursor_slot_hint = start_cursor.as_ref().map(|(_, s)| s.into_inner()).unwrap_or(0);
+    let cursor_slot_hint = start_cursor.as_ref().map(|s| s.into_inner()).unwrap_or(0);
     eprintln!("zone_query_channel_paged: channel={} cursor_slot={} limit={}",
         channel_id_hex_str, cursor_slot_hint, limit);
 
@@ -479,7 +496,7 @@ fn zone_query_channel_paged_inner(
     let result = rt.block_on(async {
         let lib_slot: u64 = match node.consensus_info().await {
             Ok(info) => {
-                let tip: u64 = info.slot.into();
+                let tip: u64 = info.cryptarchia_info.slot.into();
                 tip.saturating_sub(600)
             }
             Err(e) => {
@@ -505,7 +522,7 @@ fn zone_query_channel_paged_inner(
             if let ZoneMessage::Block(b) = msg {
                 items.push(serde_json::json!({
                     "id": hex::encode(<[u8; 32]>::from(b.id)),
-                    "data": String::from_utf8_lossy(&b.data).to_string()
+                    "data": String::from_utf8_lossy(b.data.as_slice()).to_string()
                 }));
                 last_cursor = Some((b.id, slot));
                 if items.len() >= limit as usize {
@@ -547,11 +564,12 @@ fn zone_query_channel_paged_inner(
 
 // ── Persistent sequencer handle ──────────────────────────────────────────────
 
-type SdkHandle = logos_blockchain_zone_sdk::sequencer::SequencerHandle<NodeHttpClient>;
-
 struct ZoneSequencerState {
-    handle: SdkHandle,
-    _spawn_task: tokio::task::JoinHandle<()>,
+    // v0.2: cross-task async command surface. The owned sequencer lives in the
+    // drive task; publishes route through this client and resolve as the drive
+    // loop polls next_event().
+    client: SequencerClient,
+    _drive_task: tokio::task::JoinHandle<()>,
     channel_id_hex: String,
     checkpoint_path: String,
     last_checkpoint: Mutex<Option<SequencerCheckpoint>>,
@@ -608,12 +626,15 @@ fn zone_sequencer_create_inner(
     let last_cp = checkpoint.clone();
 
     let _guard = rt.enter();
-    let (sequencer, handle) = ZoneSequencer::init(channel_id, signing_key, node, checkpoint);
-    let spawn_task = sequencer.spawn();
+    let mut sequencer = ZoneSequencer::init(channel_id, signing_key, node, checkpoint);
+    let client = sequencer.client();
+    // The drive loop must run for the lifetime of the handle so client publishes
+    // resolve and chain events keep state current.
+    let drive_task = tokio::spawn(async move { loop { let _ = sequencer.next_event().await; } });
 
     let state = Box::new(ZoneSequencerState {
-        handle,
-        _spawn_task: spawn_task,
+        client,
+        _drive_task: drive_task,
         channel_id_hex: channel_id_hex_str.to_string(),
         checkpoint_path: ckpt_path.to_string(),
         last_checkpoint: Mutex::new(last_cp),
@@ -657,27 +678,29 @@ fn zone_sequencer_publish_inner(
     eprintln!("zone_sequencer_publish: publishing {} bytes to channel {}...",
         data_bytes.len(), state.channel_id_hex);
 
+    let inscription = match Inscription::try_from(data_bytes) {
+        Ok(i) => i,
+        Err(e) => { eprintln!("zone_sequencer_publish: inscription too large/invalid: {:?}", e); return None; }
+    };
+
     let rt = get_runtime();
     let result = rt.block_on(async {
         match tokio::time::timeout(Duration::from_secs(120), async {
-            let mut handle_clone = state.handle.clone();
-            match tokio::time::timeout(Duration::from_secs(60), handle_clone.wait_ready()).await {
-                Ok(()) => {}
-                Err(_) => {
-                    eprintln!("zone_sequencer_publish: timeout waiting for sequencer ready");
-                    return None;
-                }
+            let mut ready_rx = state.client.subscribe_ready();
+            if tokio::time::timeout(Duration::from_secs(60), ready_rx.wait_for(|r| *r)).await.is_err() {
+                eprintln!("zone_sequencer_publish: timeout waiting for sequencer ready");
+                return None;
             }
 
             let mut attempts = 0;
             loop {
                 attempts += 1;
-                match state.handle.publish_message(data_bytes.clone()).await {
-                    Ok(result) => {
-                        let id_bytes: [u8; 32] = result.inscription_id.into();
+                match state.client.publish(inscription.clone()).await {
+                    Ok((res, cp)) => {
+                        let id_bytes: [u8; 32] = res.inscription_id().into();
                         let id_hex = hex::encode(id_bytes);
                         eprintln!("zone_sequencer_publish: inscription_id={}", id_hex);
-                        let mut clean_cp = result.checkpoint.clone();
+                        let mut clean_cp = cp;
                         clean_cp.pending_txs.clear();
                         save_checkpoint(&state.checkpoint_path, &clean_cp, &state.channel_id_hex);
                         if let Ok(mut guard) = state.last_checkpoint.lock() {
@@ -728,7 +751,7 @@ pub extern "C" fn zone_sequencer_checkpoint(handle: *mut std::ffi::c_void) -> *m
 pub extern "C" fn zone_sequencer_destroy(handle: *mut std::ffi::c_void) {
     if handle.is_null() { return; }
     let state = unsafe { Box::from_raw(handle as *mut ZoneSequencerState) };
-    state._spawn_task.abort();
+    state._drive_task.abort();
     drop(state);
     eprintln!("zone_sequencer_destroy: handle dropped");
 }
@@ -739,5 +762,105 @@ pub extern "C" fn zone_sequencer_destroy(handle: *mut std::ffi::c_void) {
 pub extern "C" fn zone_free_string(s: *mut c_char) {
     if !s.is_null() {
         unsafe { drop(CString::from_raw(s)); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    fn derive(key_hex: &str) -> Option<String> {
+        let c = CString::new(key_hex).ok()?;
+        let p = zone_derive_channel_id(c.as_ptr());
+        if p.is_null() {
+            return None;
+        }
+        let s = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned();
+        zone_free_string(p);
+        Some(s)
+    }
+
+    #[test]
+    fn derive_channel_id_is_deterministic_64_hex() {
+        let key = "0000000000000000000000000000000000000000000000000000000000000001";
+        let a = derive(key).expect("derive a");
+        let b = derive(key).expect("derive b");
+        assert_eq!(a, b, "derivation must be deterministic");
+        assert_eq!(a.len(), 64, "channel id is 32 bytes hex");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn derive_channel_id_distinct_keys_distinct_ids() {
+        let a = derive("00000000000000000000000000000000000000000000000000000000000000aa").unwrap();
+        let b = derive("00000000000000000000000000000000000000000000000000000000000000bb").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn derive_channel_id_rejects_bad_input() {
+        assert!(derive("not-hex").is_none());
+        assert!(derive("00").is_none(), "too short");
+        assert!(zone_derive_channel_id(std::ptr::null()).is_null());
+    }
+
+    #[test]
+    fn ffi_null_args_return_null() {
+        let n = std::ptr::null();
+        assert!(zone_publish(n, n, n, n, n).is_null());
+        assert!(zone_query_channel(n, n, 10).is_null());
+        assert!(zone_query_channel_paged(n, n, n, 10).is_null());
+        assert!(zone_sequencer_create(n, n, n, n).is_null());
+        assert!(zone_sequencer_publish(std::ptr::null_mut(), n).is_null());
+    }
+
+    #[test]
+    fn load_checkpoint_none_for_missing_or_empty_path() {
+        assert!(load_checkpoint("", "anything").is_none());
+        assert!(load_checkpoint("/nonexistent/zsr/ckpt.json", &"aa".repeat(32)).is_none());
+    }
+
+    #[test]
+    fn load_checkpoint_discards_on_channel_mismatch() {
+        let dir = std::env::temp_dir().join(format!("zsr-test-{}-mismatch", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("ckpt.json");
+        let path_str = path.to_str().unwrap();
+
+        fs::write(path_str, b"{}").unwrap();
+        // sidecar records channel aa.., but we ask to load for channel bb..
+        fs::write(sidecar_path(path_str), hex::decode("aa".repeat(32)).unwrap()).unwrap();
+
+        let got = load_checkpoint(path_str, &"bb".repeat(32));
+        assert!(got.is_none(), "stale-channel checkpoint must be rejected");
+        assert!(!std::path::Path::new(path_str).exists(), "stale checkpoint file removed");
+        assert!(!std::path::Path::new(&sidecar_path(path_str)).exists(), "stale sidecar removed");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// End-to-end against a live v0.2 testnet node. Opt-in:
+    ///   ZSR_NODE=http://100.108.127.3:8080 ZSR_KEY=<64-hex> \
+    ///     cargo test --release e2e_publish_then_query -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn e2e_publish_then_query() {
+        let node = std::env::var("ZSR_NODE").expect("set ZSR_NODE");
+        let key = std::env::var("ZSR_KEY").expect("set ZSR_KEY");
+        let cid = derive(&key).expect("derive channel id");
+
+        let nc = CString::new(node).unwrap();
+        let cc = CString::new(cid).unwrap();
+        let kc = CString::new(key).unwrap();
+        let payload = format!("zsr-e2e-{}", std::process::id());
+        let dc = CString::new(payload.clone()).unwrap();
+        let empty = CString::new("").unwrap();
+
+        let p = zone_publish(nc.as_ptr(), cc.as_ptr(), kc.as_ptr(), dc.as_ptr(), empty.as_ptr());
+        assert!(!p.is_null(), "publish returned null");
+        let id = unsafe { CStr::from_ptr(p) }.to_str().unwrap().to_owned();
+        zone_free_string(p);
+        assert_eq!(id.len(), 64, "inscription id is 32 bytes hex");
+        eprintln!("e2e: published '{}' -> inscription {}", payload, id);
     }
 }
