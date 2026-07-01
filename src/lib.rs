@@ -26,7 +26,11 @@ fn init_tracing() {
                     .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
             )
             .with_writer(std::io::stderr)
-            .init();
+            // try_init (not init): under logoscore/Qt another component may already
+            // hold the global tracing subscriber; .init() would PANIC across the FFI
+            // boundary. Ignore the "already set" error and carry on.
+            .try_init()
+            .ok();
     });
 }
 
