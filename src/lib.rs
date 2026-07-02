@@ -266,52 +266,70 @@ fn zone_publish_inner(
         Err(e) => { eprintln!("zone_publish: inscription too large/invalid: {:?}", e); return None; }
     };
 
-    let node = make_node(url);
+    // The SDK `ready` signal is intermittently slow to fire (node block-stream
+    // stalls) and a single init that misses the 60s wait_ready window fails the
+    // whole publish. A *fresh* init usually catches a good window, so retry
+    // init+ready up to 3× before giving up. See zone-sequencer-rs#7.
+    const OUTER_RETRIES: u32 = 3;
+    let mut result: Option<String> = None;
+    for outer in 1..=OUTER_RETRIES {
+        let node = make_node(url.clone());
+        let checkpoint = checkpoint.clone();
+        let signing_key = signing_key.clone();
+        let inscription = inscription.clone();
+        let attempt_result = rt.block_on(async {
+            // v0.2: init returns the sequencer alone; publish is routed through the
+            // async SequencerClient, but its await only resolves while the drive
+            // loop (next_event) is being polled — so spawn a drive task for the
+            // lifetime of this attempt.
+            let mut sequencer = ZoneSequencer::init(channel_id, signing_key, node, checkpoint);
+            let client = sequencer.client();
+            let mut ready_rx = client.subscribe_ready();
+            let drive = tokio::spawn(async move { loop { let _ = sequencer.next_event().await; } });
 
-    let result = rt.block_on(async {
-        // v0.2: init returns the sequencer alone; publish is routed through the
-        // async SequencerClient, but its await only resolves while the drive
-        // loop (next_event) is being polled — so spawn a drive task for the
-        // lifetime of the publish.
-        let mut sequencer = ZoneSequencer::init(channel_id, signing_key, node, checkpoint);
-        let client = sequencer.client();
-        let mut ready_rx = client.subscribe_ready();
-        let drive = tokio::spawn(async move { loop { let _ = sequencer.next_event().await; } });
+            let outcome = async {
+                if tokio::time::timeout(Duration::from_secs(60), ready_rx.wait_for(|r| *r)).await.is_err() {
+                    eprintln!("zone_publish: timeout waiting for sequencer ready (attempt {}/{})", outer, OUTER_RETRIES);
+                    return None;
+                }
 
-        let outcome = async {
-            if tokio::time::timeout(Duration::from_secs(60), ready_rx.wait_for(|r| *r)).await.is_err() {
-                eprintln!("zone_publish: timeout waiting for sequencer ready");
-                return None;
-            }
-
-            let mut attempts = 0;
-            loop {
-                attempts += 1;
-                match client.publish(inscription.clone()).await {
-                    Ok((res, cp)) => {
-                        let id_bytes: [u8; 32] = res.inscription_id().into();
-                        let id_hex = hex::encode(id_bytes);
-                        eprintln!("zone_publish: inscription_id={}", id_hex);
-                        let mut clean_cp = cp;
-                        clean_cp.pending_txs.clear();
-                        save_checkpoint(ckpt_path, &clean_cp, channel_id_hex_str);
-                        return Some(id_hex);
-                    }
-                    Err(e) => {
-                        if attempts > 5 {
-                            eprintln!("zone_publish: failed after {} attempts: {}", attempts, e);
-                            return None;
+                let mut attempts = 0;
+                loop {
+                    attempts += 1;
+                    match client.publish(inscription.clone()).await {
+                        Ok((res, cp)) => {
+                            let id_bytes: [u8; 32] = res.inscription_id().into();
+                            let id_hex = hex::encode(id_bytes);
+                            eprintln!("zone_publish: inscription_id={}", id_hex);
+                            let mut clean_cp = cp;
+                            clean_cp.pending_txs.clear();
+                            save_checkpoint(ckpt_path, &clean_cp, channel_id_hex_str);
+                            return Some(id_hex);
                         }
-                        eprintln!("zone_publish: attempt {}: {} — retrying in 1s...", attempts, e);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        Err(e) => {
+                            if attempts > 5 {
+                                eprintln!("zone_publish: failed after {} attempts: {}", attempts, e);
+                                return None;
+                            }
+                            eprintln!("zone_publish: attempt {}: {} — retrying in 1s...", attempts, e);
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                        }
                     }
                 }
-            }
-        }.await;
+            }.await;
 
-        drive.abort();
-        outcome
-    })?;
+            drive.abort();
+            outcome
+        });
+        if attempt_result.is_some() {
+            result = attempt_result;
+            break;
+        }
+        if outer < OUTER_RETRIES {
+            eprintln!("zone_publish: re-initializing sequencer (attempt {}/{})...", outer + 1, OUTER_RETRIES);
+        }
+    }
+    let result = result?;
 
     CString::new(result).ok()
 }
@@ -689,10 +707,20 @@ fn zone_sequencer_publish_inner(
 
     let rt = get_runtime();
     let result = rt.block_on(async {
-        match tokio::time::timeout(Duration::from_secs(120), async {
-            let mut ready_rx = state.client.subscribe_ready();
-            if tokio::time::timeout(Duration::from_secs(60), ready_rx.wait_for(|r| *r)).await.is_err() {
-                eprintln!("zone_sequencer_publish: timeout waiting for sequencer ready");
+        match tokio::time::timeout(Duration::from_secs(200), async {
+            // Retry the ready-wait: the persistent drive loop keeps polling
+            // next_event(), so a fresh subscribe+wait can catch a `ready` that an
+            // earlier 60s window missed (intermittent node stalls). See #7.
+            let mut ready = false;
+            for outer in 1..=3u32 {
+                let mut ready_rx = state.client.subscribe_ready();
+                if tokio::time::timeout(Duration::from_secs(60), ready_rx.wait_for(|r| *r)).await.is_ok() {
+                    ready = true;
+                    break;
+                }
+                eprintln!("zone_sequencer_publish: timeout waiting for sequencer ready (attempt {}/3)", outer);
+            }
+            if !ready {
                 return None;
             }
 
