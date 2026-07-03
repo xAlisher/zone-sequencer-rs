@@ -164,7 +164,9 @@ async fn bootstrap_checkpoint(
     {
         Ok(resp) if resp.status().is_success() => {
             let tip = resp.json::<serde_json::Value>().await.ok()
-                .and_then(|v| v.get("tip").and_then(|t| t.as_str()).map(String::from))
+                // v0.2 /channel returns the tip as `tip_message` (was `tip` in v0.1.2).
+                // Reading the wrong key made every non-first op fail to chain (InvalidParent).
+                .and_then(|v| v.get("tip_message").and_then(|t| t.as_str()).map(String::from))
                 .and_then(|h| hex::decode(h).ok())
                 .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
             if let Some(tip_bytes) = tip {
